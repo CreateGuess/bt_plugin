@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>行为树监控</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f6f3;
+      --panel: #fff;
+      --text: #17201d;
+      --muted: #68736f;
+      --border: #d9ded9;
+      --primary: #12665e;
+      --idle: #9aa29f;
+      --running: #2f7fb3;
+      --success: #26865a;
+      --failure: #c34a43;
+      --skipped: #a87525;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif;
+    }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    .app { width: min(1200px, calc(100% - 28px)); margin: 28px auto; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 20px; margin-bottom: 18px;
+    }
+    h1, h2 { margin: 0; font-weight: 600; }
+    header p { margin: 5px 0 0; color: var(--muted); }
+    .badge {
+      padding: 7px 12px; border: 1px solid var(--border);
+      border-radius: 999px; background: var(--panel); white-space: nowrap;
+    }
+    .badge.connected { color: var(--success); }
+    .controls, .card {
+      border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+    }
+    .controls {
+      display: flex; align-items: end; gap: 10px; padding: 14px; margin-bottom: 14px;
+    }
+    label { display: grid; flex: 1; gap: 5px; color: var(--muted); }
+    input {
+      width: 100%; padding: 10px 12px; border: 1px solid var(--border);
+      border-radius: 8px; background: var(--panel); color: var(--text); outline: none;
+    }
+    input:focus { border-color: var(--primary); }
+    button {
+      padding: 10px 16px; border: 0; border-radius: 8px;
+      background: var(--primary); color: #fff;
+    }
+    button.secondary { background: #727c78; }
+    .error {
+      display: none; padding: 10px 12px; margin-bottom: 14px;
+      border-left: 4px solid var(--failure); background: color-mix(in srgb, var(--failure) 12%, var(--panel));
+    }
+    .metrics {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px;
+    }
+    .metric { padding: 14px; }
+    .metric span, .metric small { display: block; color: var(--muted); }
+    .metric strong { display: block; margin: 4px 0; font-size: 20px; }
+    .layout { display: grid; grid-template-columns: 1fr 320px; gap: 14px; align-items: start; }
+    .tree-panel, .side-panel { padding: 16px; }
+    .panel-title {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 10px; margin-bottom: 14px;
+    }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px; color: var(--muted); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+    .dot.running { background: var(--running); }
+    .dot.success { background: var(--success); }
+    .dot.failure { background: var(--failure); }
+    #tree { display: grid; gap: 6px; }
+    .node {
+      display: grid; grid-template-columns: 10px minmax(0, 1fr) auto;
+      align-items: center; gap: 10px; width: calc(100% - var(--indent));
+      margin-left: var(--indent); padding: 10px 12px;
+      border: 1px solid var(--border); border-radius: 9px;
+      background: var(--panel); color: var(--text); text-align: left;
+    }
+    .node:hover { border-color: var(--primary); }
+    .node.selected { outline: 2px solid var(--primary); }
+    .node-main { overflow: hidden; }
+    .node-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .node-meta, .node-status { color: var(--muted); font-size: 12px; }
+    .node[data-status="RUNNING"] .dot { background: var(--running); }
+    .node[data-status="SUCCESS"] .dot { background: var(--success); }
+    .node[data-status="FAILURE"] .dot { background: var(--failure); }
+    .node[data-status="SKIPPED"] .dot { background: var(--skipped); }
+    .empty { padding: 60px 10px; color: var(--muted); text-align: center; }
+    dl { margin: 0; }
+    dl div {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 9px 0; border-bottom: 1px solid var(--border);
+    }
+    dt { color: var(--muted); }
+    dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+    .events { max-height: 330px; margin: 16px 0 0; padding: 0; overflow: auto; list-style: none; }
+    .events li { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+    .events time { margin-right: 8px; color: var(--muted); }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111714; --panel: #1a221f; --text: #edf2ef;
+        --muted: #9da8a3; --border: #35413c; --primary: #58bcb1;
+      }
+    }
+    @media (max-width: 800px) {
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+      .layout { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      header, .controls { align-items: stretch; flex-direction: column; }
+      .metrics { grid-template-columns: 1fr; }
+      .controls button { width: 100%; }
+      .node-status { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <h1>行为树监控</h1>
+        <p>Groot2 · xplugin 实时状态面板</p>
+      </div>
+      <span id="connectionBadge" class="badge">未连接</span>
+    </header>
+
+    <section class="controls">
+      <label>
+        插件宿主地址（不是 Groot2 的 1667 端口）
+        <input id="baseUrl" placeholder="例如：http://192.168.2.36:80">
+      </label>
+      <button id="connectButton">连接</button>
+      <button id="disconnectButton" class="secondary" disabled>断开</button>
+    </section>
+
+    <div id="error" class="error" role="alert"></div>
+
+    <section class="metrics">
+      <article class="card metric"><span>Groot2 后端</span><strong id="backend">离线</strong><small id="backendAddress">—</small></article>
+      <article class="card metric"><span>节点数量</span><strong id="nodeCount">0</strong><small id="runningCount">0 个运行中</small></article>
+      <article class="card metric"><span>查看者</span><strong id="viewerCount">0</strong><small>WebSocket 会话</small></article>
+      <article class="card metric"><span>最后通信</span><strong id="lastSuccess">—</strong><small id="sendFailures">发送失败 0 次</small></article>
+    </section>
+
+    <section class="layout">
+      <article class="card tree-panel">
+        <div class="panel-title">
+          <h2 id="treeTitle">等待行为树</h2>
+          <div class="legend">
+            <span><i class="dot running"></i>运行中</span>
+            <span><i class="dot success"></i>成功</span>
+            <span><i class="dot failure"></i>失败</span>
+            <span><i class="dot"></i>空闲</span>
+          </div>
+        </div>
+        <div id="tree"><div class="empty">输入插件宿主地址，然后点击“连接”。</div></div>
+      </article>
+
+      <aside class="card side-panel">
+        <h2>节点详情</h2>
+        <dl id="details"><div><dt>状态</dt><dd>未选择节点</dd></div></dl>
+        <h2 style="margin-top:22px">最近事件</h2>
+        <ol id="events" class="events"><li>连接后，状态变化会显示在这里。</li></ol>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const elements = {
+      baseUrl: document.getElementById("baseUrl"),
+      connect: document.getElementById("connectButton"),
+      disconnect: document.getElementById("disconnectButton"),
+      badge: document.getElementById("connectionBadge"),
+      error: document.getElementById("error"),
+      backend: document.getElementById("backend"),
+      backendAddress: document.getElementById("backendAddress"),
+      nodeCount: document.getElementById("nodeCount"),
+      runningCount: document.getElementById("runningCount"),
+      viewerCount: document.getElementById("viewerCount"),
+      lastSuccess: document.getElementById("lastSuccess"),
+      sendFailures: document.getElementById("sendFailures"),
+      treeTitle: document.getElementById("treeTitle"),
+      tree: document.getElementById("tree"),
+      details: document.getElementById("details"),
+      events: document.getElementById("events")
+    };
+
+    const labels = {
+      IDLE: "空闲", RUNNING: "运行中", SUCCESS: "成功", FAILURE: "失败",
+      SKIPPED: "已跳过", IDLE_FROM_RUNNING: "运行后空闲",
+      IDLE_FROM_SUCCESS: "成功后空闲", IDLE_FROM_FAILURE: "失败后空闲",
+      IDLE_FROM_SKIPPED: "跳过后空闲"
+    };
+
+    let socket = null;
+    let healthTimer = null;
+    let treeRoot = null;
+    let selectedUid = null;
+    const statuses = new Map();
+
+    function base() {
+      const value = elements.baseUrl.value.trim().replace(/\/+$/, "");
+      return value || location.origin;
+    }
+
+    function httpUrl(route) {
+      return `${base()}/backend/plugin-http/behavior_tree_monitor/${route}`;
+    }
+
+    function websocketUrl() {
+      const url = new URL(base());
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.pathname = "/backend/plugin-ws/behavior_tree_monitor";
+      url.search = "";
+      return url.toString();
+    }
+
+    function showError(message = "") {
+      elements.error.textContent = message;
+      elements.error.style.display = message ? "block" : "none";
+    }
+
+    function setConnected(connected, text) {
+      elements.badge.textContent = text;
+      elements.badge.classList.toggle("connected", connected);
+      elements.connect.disabled = text === "连接中";
+      elements.disconnect.disabled = !connected;
+    }
+
+    function formatTime(value) {
+      return value ? new Date(value).toLocaleTimeString("zh-CN", { hour12: false }) : "—";
+    }
+
+    function addEvent(message) {
+      if (elements.events.firstElementChild?.textContent.includes("连接后")) elements.events.innerHTML = "";
+      const li = document.createElement("li");
+      const time = document.createElement("time");
+      time.textContent = formatTime(Date.now());
+      li.append(time, document.createTextNode(message));
+      elements.events.prepend(li);
+      while (elements.events.children.length > 40) elements.events.lastElementChild.remove();
+    }
+
+    async function request(route) {
+      const response = await fetch(httpUrl(route), {
+        method: "POST",
+        headers: { Accept: "application/json" }
+      });
+      const body = await response.json();
+      if (!response.ok || body.code !== 0) throw new Error(body.message || `HTTP ${response.status}`);
+      return body.data;
+    }
+
+    function walk(node, depth = 0, result = []) {
+      if (!node) return result;
+      result.push({ node, depth });
+      (node.children || []).forEach(child => walk(child, depth + 1, result));
+      return result;
+    }
+
+    function renderDetails(node) {
+      if (!node) {
+        elements.details.innerHTML = "<div><dt>状态</dt><dd>未选择节点</dd></div>";
+        return;
+      }
+      const status = statuses.get(String(node.uid)) || node.status || "IDLE";
+      elements.details.innerHTML = `
+        <div><dt>名称</dt><dd>${escapeHtml(node.name || "—")}</dd></div>
+        <div><dt>类型</dt><dd>${escapeHtml(node.kind || "—")}</dd></div>
+        <div><dt>UID</dt><dd>${escapeHtml(String(node.uid))}</dd></div>
+        <div><dt>状态</dt><dd>${escapeHtml(labels[status] || status)}</dd></div>`;
+    }
+
+    function escapeHtml(value) {
+      const span = document.createElement("span");
+      span.textContent = value;
+      return span.innerHTML;
+    }
+
+    function renderTree() {
+      const nodes = walk(treeRoot);
+      elements.tree.innerHTML = "";
+      elements.nodeCount.textContent = nodes.length;
+      elements.runningCount.textContent =
+        `${nodes.filter(({ node }) => (statuses.get(String(node.uid)) || node.status) === "RUNNING").length} 个运行中`;
+      elements.treeTitle.textContent = treeRoot?.name || "等待行为树";
+
+      if (!nodes.length) {
+        elements.tree.innerHTML = '<div class="empty">尚未收到行为树。</div>';
+        return;
+      }
+
+      for (const { node, depth } of nodes) {
+        const status = statuses.get(String(node.uid)) || node.status || "IDLE";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `node${String(node.uid) === String(selectedUid) ? " selected" : ""}`;
+        button.dataset.status = status;
+        button.style.setProperty("--indent", `${Math.min(depth * 20, 180)}px`);
+        button.innerHTML = `
+          <i class="dot"></i>
+          <span class="node-main">
+            <strong class="node-name">${escapeHtml(node.name || "未命名节点")}</strong>
+            <small class="node-meta">${escapeHtml(node.kind || "Node")} · UID ${escapeHtml(String(node.uid))}</small>
+          </span>
+          <span class="node-status">${escapeHtml(labels[status] || status)}</span>`;
+        button.addEventListener("click", () => {
+          selectedUid = node.uid;
+          renderTree();
+          renderDetails(node);
+        });
+        elements.tree.appendChild(button);
+      }
+    }
+
+    async function refreshHealth() {
+      try {
+        const health = await request("bridge.health");
+        elements.backend.textContent = health.backend_connected ? "在线" : "离线";
+        elements.backendAddress.textContent = `${health.backend.host}:${health.backend.port}`;
+        elements.viewerCount.textContent = health.viewer_count;
+        elements.lastSuccess.textContent = formatTime(health.last_success_ms);
+        elements.sendFailures.textContent = `发送失败 ${health.ws_send_failures} 次`;
+        if (health.last_error) showError(health.last_error);
+      } catch (_) {
+        elements.backend.textContent = "离线";
+      }
+    }
+
+    async function loadSnapshots() {
+      const results = await Promise.allSettled([request("tree.snapshot"), request("status.snapshot")]);
+      if (results[0].status === "fulfilled") {
+        treeRoot = results[0].value.root || results[0].value;
+      }
+      if (results[1].status === "fulfilled") {
+        statuses.clear();
+        (results[1].value.statuses || []).forEach(item => statuses.set(String(item.uid), item.status));
+      }
+      renderTree();
+    }
+
+    function disconnect() {
+      clearInterval(healthTimer);
+      healthTimer = null;
+      if (socket) {
+        socket.onclose = null;
+        socket.close();
+        socket = null;
+      }
+      setConnected(false, "未连接");
+    }
+
+    async function connect() {
+      disconnect();
+      showError();
+      setConnected(false, "连接中");
+      localStorage.setItem("bt-monitor-base", elements.baseUrl.value.trim());
+
+      await Promise.allSettled([loadSnapshots(), refreshHealth()]);
+
+      try {
+        socket = new WebSocket(websocketUrl());
+        socket.onopen = () => {
+          setConnected(true, "已连接");
+          addEvent("WebSocket 已连接");
+          socket.send(JSON.stringify({ action: "snapshot" }));
+        };
+        socket.onmessage = event => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === "tree") {
+              treeRoot = message.root;
+              renderTree();
+              addEvent(`收到行为树：${message.root?.name || "未命名"}`);
+            } else if (message.type === "status") {
+              statuses.set(String(message.uid), message.status);
+              renderTree();
+              if (String(selectedUid) === String(message.uid)) {
+                const selected = walk(treeRoot).find(({ node }) => String(node.uid) === String(message.uid));
+                if (selected) renderDetails(selected.node);
+              }
+              addEvent(`节点 ${message.uid} → ${message.status}`);
+            } else if (message.type === "bridge_status") {
+              showError(message.message || message.status);
+              addEvent(`桥接状态：${message.message || message.status}`);
+            } else if (message.type === "error") {
+              showError(message.message);
+            }
+          } catch (_) {
+            addEvent("收到无法解析的消息");
+          }
+        };
+        socket.onerror = () => showError("WebSocket 连接失败，请检查宿主地址和浏览器控制台。");
+        socket.onclose = () => {
+          socket = null;
+          setConnected(false, "已断开");
+          addEvent("WebSocket 已断开");
+        };
+        healthTimer = setInterval(refreshHealth, 5000);
+      } catch (error) {
+        showError(error.message);
+        setConnected(false, "未连接");
+      }
+    }
+
+    elements.baseUrl.value = localStorage.getItem("bt-monitor-base") || "";
+    elements.connect.addEventListener("click", connect);
+    elements.disconnect.addEventListener("click", disconnect);
+    window.addEventListener("beforeunload", disconnect);
+  </script>
+</body>
+</html>
