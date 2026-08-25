@@ -1,7 +1,6 @@
 #include "bt_monitor_plugin.hpp"
 
 #include <tinyxml2.h>
-#include <zmq.h>
 
 #include <array>
 #include <atomic>
@@ -17,12 +16,10 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <plugin_core/sdk/plugin_logx.hpp>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -54,16 +51,6 @@ namespace {
     const fs::path canonical_path = fs::weakly_canonical(file_path, ec);
     if (ec) return std::nullopt;
     return canonical_path;
-  }
-
-  /**
-   * @breif 生成随机数
-   */
-  std::uint32_t random_u32() {
-    thread_local std::mt19937 generator(std::random_device{}());
-    std::uniform_int_distribution<std::uint32_t> distribution(
-        1U, std::numeric_limits<std::uint32_t>::max());
-    return distribution(generator);
   }
 
   /**
@@ -138,166 +125,7 @@ namespace {
     }
   }
 
-  void set_zmq_int_option(void* socket, int option, int value, const char* option_name) {
-    if (zmq_setsockopt(socket, option, &value, sizeof(value)) != 0) {
-      throw std::runtime_error(std::string("zmq_setsockopt(") + option_name
-                               + ") failed: " + zmq_strerror(zmq_errno()));
-    }
-  }
-
 }  // namespace
-
-/**
- * @brief 构造函数
- * @param host Groot2 Publisher 的主机地址
- * @param port Groot2 Publisher 的端口
- * @param recv_timeout_ms 接收超时时间（毫秒）
- * @param send_timeout_ms 发送超时时间（毫秒）
- */
-Groot2Client::Groot2Client(std::string host, int port, int recv_timeout_ms, int send_timeout_ms)
-    : address_("tcp://" + std::move(host) + ":" + std::to_string(port)) {
-  // 1. 创建 ZeroMQ 上下文
-  context_ = zmq_ctx_new();
-  if (!context_) {
-    throw std::runtime_error(std::string("zmq_ctx_new failed: ") + zmq_strerror(zmq_errno()));
-  }
-  // 2. 创建 ZMQ_REQ 套接字，使用 REQ-REP 模式与 Groot2 Publisher 通信
-  // 发送一次请求，接收一次响应，再发送下一次请求
-  socket_ = zmq_socket(context_, ZMQ_REQ);
-  if (!socket_) {
-    const std::string error = zmq_strerror(zmq_errno());
-    close();
-    throw std::runtime_error("zmq_socket(ZMQ_REQ) failed: " + error);
-  }
-  // 3. 超时配置
-  try {
-    set_zmq_int_option(socket_, ZMQ_RCVTIMEO, recv_timeout_ms, "ZMQ_RCVTIMEO");
-    set_zmq_int_option(socket_, ZMQ_SNDTIMEO, send_timeout_ms, "ZMQ_SNDTIMEO");
-    set_zmq_int_option(socket_, ZMQ_LINGER, 0, "ZMQ_LINGER");
-
-    if (zmq_connect(socket_, address_.c_str()) != 0) {
-      throw std::runtime_error("zmq_connect(" + address_
-                               + ") failed: " + zmq_strerror(zmq_errno()));
-    }
-  } catch (...) {
-    close();
-    throw;
-  }
-}
-
-Groot2Client::~Groot2Client() { close(); }
-
-/**
- * @brief 关闭 ZeroMQ 套接字和上下文
- */
-void Groot2Client::close() noexcept {
-  if (socket_) {
-    zmq_close(socket_);
-    socket_ = nullptr;
-  }
-  if (context_) {
-    zmq_ctx_term(context_);
-    context_ = nullptr;
-  }
-}
-
-/**
- * @brief 构造 Groot2 请求头
- * - byte 0：协议版本
- * - byte 1：请求类型，'T' 获取完整树，'S' 获取状态
- * - byte 2~5：32位随机请求ID，小端序
- *
- * @param request_type 请求类型
- * @return 请求头
- */
-std::vector<std::uint8_t> Groot2Client::make_header(std::uint8_t request_type) {
-  const std::uint32_t unique_id = random_u32();
-  return {
-      BehaviorTreeMonitor::PROTOCOL_ID,
-      request_type,
-      static_cast<std::uint8_t>(unique_id & 0xFFU),
-      static_cast<std::uint8_t>((unique_id >> 8U) & 0xFFU),
-      static_cast<std::uint8_t>((unique_id >> 16U) & 0xFFU),
-      static_cast<std::uint8_t>((unique_id >> 24U) & 0xFFU),
-  };
-}
-
-/**
- * @brief 发送请求并接收 multipart 响应
- * @param request_type 请求类型
- * @return 响应数据
- */
-std::vector<std::vector<std::uint8_t>> Groot2Client::request(std::uint8_t request_type) {
-  // 1. 检查套接字是否有效
-  if (!socket_) throw std::runtime_error("Groot2 ZMQ socket is closed");
-  // 2. 构造请求头
-  const auto header = make_header(request_type);
-  // 3. 发送请求头
-  const int sent = zmq_send(socket_, header.data(), header.size(), 0);
-  // 4. 检查发送结果
-  if (sent < 0) {
-    throw std::runtime_error(std::string("Groot2 request send failed: ")
-                             + zmq_strerror(zmq_errno()));
-  }
-  if (static_cast<std::size_t>(sent) != header.size()) {
-    throw std::runtime_error("Groot2 request header was only partially sent");
-  }
-  // 5. 接收 multipart 响应
-  std::vector<std::vector<std::uint8_t>> parts;
-  while (true) {
-    // 初始化 ZMQ 消息
-    zmq_msg_t message;
-    if (zmq_msg_init(&message) != 0) {
-      throw std::runtime_error(std::string("zmq_msg_init failed: ") + zmq_strerror(zmq_errno()));
-    }
-    // 接收消息
-    const int received = zmq_msg_recv(&message, socket_, 0);
-    if (received < 0) {
-      const std::string error = zmq_strerror(zmq_errno());
-      zmq_msg_close(&message);
-      throw std::runtime_error("Groot2 reply receive failed: " + error);
-    }
-    // 检查接收的消息大小
-    const auto* begin = static_cast<const std::uint8_t*>(zmq_msg_data(&message));
-    const std::size_t size = zmq_msg_size(&message);
-    parts.emplace_back(begin, begin + size);
-    // 检查是否还有更多消息
-    int more = 0;
-    std::size_t more_size = sizeof(more);
-    if (zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_size) != 0) {
-      const std::string error = zmq_strerror(zmq_errno());
-      zmq_msg_close(&message);
-      throw std::runtime_error("zmq_getsockopt(ZMQ_RCVMORE) failed: " + error);
-    }
-
-    zmq_msg_close(&message);
-    if (!more) break;
-  }
-
-  return parts;
-}
-
-/**
- * @brief 获取完整的行为树 XML
- */
-std::string Groot2Client::get_full_tree_xml() {
-  const auto reply = request(BehaviorTreeMonitor::REQ_FULLTREE);
-  if (reply.size() < 2) {
-    throw std::runtime_error("FULLTREE reply parts invalid: " + std::to_string(reply.size()));
-  }
-  return std::string(reply[1].begin(), reply[1].end());
-}
-
-/**
- * @brief 获取行为树节点状态字节流
- */
-std::vector<std::uint8_t> Groot2Client::get_status_buffer() {
-  const auto reply = request(BehaviorTreeMonitor::REQ_STATUS);
-  if (reply.size() < 2) {
-    throw std::runtime_error("STATUS reply parts invalid: " + std::to_string(reply.size()));
-  }
-  return reply[1];
-}
 
 /**
  * @brief 构造函数
@@ -307,23 +135,132 @@ BehaviorTreeMonitor::BehaviorTreeMonitor(WsSendText ws_send_text,
     : ws_send_text_(std::move(ws_send_text)),
       ws_send_latest_text_(std::move(ws_send_latest_text)) {}
 
-BehaviorTreeMonitor::~BehaviorTreeMonitor() { stop_poll_thread(); }
+BehaviorTreeMonitor::~BehaviorTreeMonitor() {
+  // Host 在插件对象析构前已回收托管 worker。此处不调用
+  // stop() 记日志，因为 on_unload() 可能已销毁日志实例。
+  running_.store(false, std::memory_order_release);
+  event_cv_.notify_all();
+}
 
 /**
- * @brief 启动监控线程
+ * @brief 将监控组件置为可接收事件状态。
+ *
+ * 本函数不创建线程。实际的事件消费入口 run_event_loop()
+ * 由 BehaviorTreePlug 使用 start_managed_worker() 交给 Host 运行。
  */
 void BehaviorTreeMonitor::start() {
-  start_poll_thread();
-  LOG_INFO("[{}] Started: Groot2 {}:{}", TAG, bt_host_, bt_port_);
+  running_.store(true, std::memory_order_release);
+  LOG_INFO("[{}] Started in event-driven mode", TAG);
 }
 
 void BehaviorTreeMonitor::stop() noexcept {
-  stop_poll_thread();
+  // 不 join 线程：Host 会回收 start_managed_worker() 创建的 worker。
+  // 这里只改变状态并唤醒可能阻塞在条件变量上的 worker。
+  running_.store(false, std::memory_order_release);
+  event_cv_.notify_all();
+
+  {
+    std::lock_guard<std::mutex> lock(event_mutex_);
+    event_queue_.clear();
+  }
   {
     std::lock_guard<std::mutex> lock(viewers_mutex_);
     viewers_.clear();
   }
+  {
+    // 插件下次 start 会构造新的 BTManager。清理旧树快照，
+    // 避免新行为树尚未加载时 HTTP 误返回上一次运行的数据。
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    latest_tree_message_.reset();
+    latest_status_.clear();
+  }
+  last_success_ms_.store(0, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    last_error_.clear();
+  }
   LOG_INFO("[{}] Stopped", TAG);
+}
+
+/**
+ * @brief 投递“行为树已重建”事件。
+ *
+ * 该函数会在 BTManager 持有树锁时被调用，因此只移动字符串并
+ * 入队。XML 解析和 WebSocket 广播由 Host 托管的
+ * run_event_loop() 异步执行。
+ */
+void BehaviorTreeMonitor::enqueue_tree_reset(std::string tree_xml) noexcept {
+  // 1. 如果监控已停止，直接丢弃事件。
+  if (!running_.load(std::memory_order_acquire)) return;
+
+  try {
+    // 2. 构造事件并入队。队列中只保留最新的树切换事件，旧的树切换事件会被丢弃。
+    BehaviorTreeMonitorEvent event;
+    event.type = BehaviorTreeMonitorEvent::Type::TreeReset;
+    event.tree_xml = std::move(tree_xml);
+    {
+      std::lock_guard<std::mutex> lock(event_mutex_);
+      if (!running_.load(std::memory_order_relaxed)) return;
+
+      // 新树已经使队列中尚未处理的旧树状态失效。先清理它们，
+      // 可以保证切树后不会再把旧 UID 的状态发给前端。
+      coalesced_events_.fetch_add(event_queue_.size(), std::memory_order_relaxed);
+      event_queue_.clear();
+      event_queue_.push_back(std::move(event));
+      received_events_.fetch_add(1, std::memory_order_relaxed);
+    }
+    event_cv_.notify_one();
+  } catch (const std::exception& e) {
+    LOG_ERROR("[{}] Failed to enqueue tree reset event: {}", TAG, e.what());
+  } catch (...) {
+    LOG_ERROR("[{}] Failed to enqueue tree reset event", TAG);
+  }
+}
+
+/**
+ * @brief 投递节点状态变化事件。
+ *
+ * 状态回调处于行为树 tick 路径上，这里绝不直接调用
+ * ws_send_*()，以免前端慢连接影响行为树的执行周期。
+ */
+void BehaviorTreeMonitor::enqueue_node_status(std::uint16_t uid, std::uint8_t status_code,
+                                              std::int64_t timestamp_ms) noexcept {
+  // 1. 如果监控已停止，直接丢弃事件。
+  if (!running_.load(std::memory_order_acquire)) return;
+
+  try {
+    // 2. 构造事件并入队。队列中同一 UID 的状态变化只保留最新的，旧的状态会被丢弃。
+    BehaviorTreeMonitorEvent event;
+    event.type = BehaviorTreeMonitorEvent::Type::NodeStatus;
+    event.status = {uid, status_code, status_name(status_code), timestamp_ms};
+    {
+      std::lock_guard<std::mutex> lock(event_mutex_);
+      if (!running_.load(std::memory_order_relaxed)) return;
+
+      // WebSocket 使用 ws_send_latest_text 时，同一 UID 只需要保留最新
+      // 待发状态。如果托管 worker 短时间跟不上 tick，在这里先合并
+      // 队列中同 UID 的旧事件，避免队列无界增长。
+      auto previous = event_queue_.end();
+      for (auto it = event_queue_.begin(); it != event_queue_.end(); ++it) {
+        if (it->type == BehaviorTreeMonitorEvent::Type::TreeReset) {
+          previous = event_queue_.end();
+        } else if (it->status.uid == uid) {
+          previous = it;
+        }
+      }
+      if (previous != event_queue_.end()) {
+        event_queue_.erase(previous);
+        coalesced_events_.fetch_add(1, std::memory_order_relaxed);
+      }
+      event_queue_.push_back(std::move(event));
+      received_events_.fetch_add(1, std::memory_order_relaxed);
+    }
+    event_cv_.notify_one();
+  } catch (const std::exception& e) {
+    LOG_ERROR("[{}] Failed to enqueue node status event: {}", TAG, e.what());
+  } catch (...) {
+    LOG_ERROR("[{}] Failed to enqueue node status event", TAG);
+  }
 }
 
 PluginHttpResponse BehaviorTreeMonitor::handle_http_request(const PluginHttpRequest& req) {
@@ -359,7 +296,7 @@ PluginHttpResponse BehaviorTreeMonitor::handle_tree_snapshot() {
   if (!latest_tree_message_) {
     return json_response(503, -1, "behavior tree is not available yet");
   }
-  return json_response(200, 0, "behavior tree snapshot", *latest_tree_message_);
+  return json_response(200, 0, "ok", *latest_tree_message_);
 }
 
 /**
@@ -376,7 +313,7 @@ PluginHttpResponse BehaviorTreeMonitor::handle_status_snapshot() {
       });
     }
   }
-  return json_response(200, 0, "behavior tree status snapshot",
+  return json_response(200, 0, "ok",
                        {{"statuses", std::move(statuses)}, {"timestamp_ms", current_time_ms()}});
 }
 
@@ -396,18 +333,33 @@ PluginHttpResponse BehaviorTreeMonitor::handle_bridge_health() {
     viewer_count = viewers_.size();
   }
 
+  std::size_t pending_events = 0;
+  {
+    std::lock_guard<std::mutex> lock(event_mutex_);
+    pending_events = event_queue_.size();
+  }
+
   nlohmann::json data = {
       {"running", running_.load()},
-      {"backend_connected", backend_connected_.load()},
-      {"backend", {{"host", bt_host_}, {"port", bt_port_}}},
-      {"poll_interval_ms", status_poll_interval_ms_},
+      {"mode", "event_driven"},
+      {"event_source_connected", running_.load()},
+      // 保留旧健康接口字段，避免已部署前端因字段突然消失
+      // 而报错。port=0 和 poll_interval_ms=0 明确表示已不再使用
+      // TCP/ZeroMQ 轮询链路。
+      {"backend_connected", running_.load()},
+      {"backend", {{"host", "in-process"}, {"port", 0}}},
+      {"poll_interval_ms", 0},
       {"viewer_count", viewer_count},
+      {"pending_events", pending_events},
+      {"received_events", received_events_.load()},
+      {"coalesced_events", coalesced_events_.load()},
+      {"processed_events", processed_events_.load()},
       {"last_success_ms", last_success_ms_.load()},
       {"last_error", last_error},
       {"ws_send_failures", ws_send_failures_.load()},
   };
 
-  return json_response(200, 0, "behavior tree bridge health", std::move(data));
+  return json_response(200, 0, "ok", std::move(data));
 }
 
 /**
@@ -419,9 +371,8 @@ PluginHttpResponse BehaviorTreeMonitor::handle_bridge_health() {
 PluginHttpResponse BehaviorTreeMonitor::handle_load_node() {
   const auto file_path = resolve_bt_nodes_path();
   if (!file_path) {
-    return json_response(
-        404, -1,
-        "bt_nodes.xml not found; expected <rpc_gateway>/bt_trees/bt_nodes.xml");
+    return json_response(404, -1,
+                         "bt_nodes.xml not found; expected <rpc_gateway>/bt_trees/bt_nodes.xml");
   }
 
   std::ifstream input(*file_path, std::ios::in | std::ios::binary);
@@ -446,10 +397,8 @@ PluginHttpResponse BehaviorTreeMonitor::handle_load_node() {
   tinyxml2::XMLDocument document;
   const tinyxml2::XMLError parse_result = document.Parse(xml_text.data(), xml_text.size());
   if (parse_result != tinyxml2::XML_SUCCESS) {
-    LOG_ERROR("[{}] Invalid node model XML {}: {}", TAG, file_path->string(),
-              document.ErrorStr());
-    return json_response(422, -1,
-                         std::string("invalid bt_nodes.xml: ") + document.ErrorStr());
+    LOG_ERROR("[{}] Invalid node model XML {}: {}", TAG, file_path->string(), document.ErrorStr());
+    return json_response(422, -1, std::string("invalid bt_nodes.xml: ") + document.ErrorStr());
   }
 
   const tinyxml2::XMLElement* root = document.RootElement();
@@ -478,13 +427,12 @@ PluginHttpResponse BehaviorTreeMonitor::handle_load_node() {
     ++node_count;
   }
 
-  LOG_INFO("[{}] Loaded node model file: {} ({} nodes, {} bytes)", TAG,
-           file_path->string(), node_count, xml_text.size());
+  LOG_INFO("[{}] Loaded node model file: {} ({} nodes, {} bytes)", TAG, file_path->string(),
+           node_count, xml_text.size());
 
-  return json_response(200, 0, "behavior tree node model loaded",
-                       {{"file", BT_NODES_FILE_NAME},
-                        {"content", std::move(xml_text)},
-                        {"node_count", node_count}});
+  return json_response(
+      200, 0, "ok",
+      {{"file", BT_NODES_FILE_NAME}, {"content", std::move(xml_text)}, {"node_count", node_count}});
 }
 
 void BehaviorTreeMonitor::handle_ws_open(const char* session_id) {
@@ -539,104 +487,91 @@ void BehaviorTreeMonitor::handle_ws_message(const char* session_id, const void* 
 }
 
 /**
- * @brief 启动轮询线程
+ * @brief Host 托管 worker 执行的监控事件分发循环。
+ *
+ * worker 在没有状态变化时通过条件变量休眠，不再向
+ * 1667 端口发送 STATUS 请求。
+ *
+ * wait_for 的超时只用于观察 PluginStopToken，不会触发数据查询。
+ * 当 Host 请求停止但此时没有新的行为树事件时，worker
+ * 最多 250 ms 就能观察到停止请求并返回。
  */
-void BehaviorTreeMonitor::start_poll_thread() {
-  bool expected = false;
-  if (!running_.compare_exchange_strong(expected, true)) return;
-  poll_thread_ = std::thread([this] { poll_loop(); });
+void BehaviorTreeMonitor::run_event_loop(PluginStopToken stop) noexcept {
+  while (running_.load(std::memory_order_acquire) && !stop.stop_requested()) {
+    BehaviorTreeMonitorEvent event;
+    {
+      // 1. 等待事件队列非空或 Host 请求停止
+      std::unique_lock<std::mutex> lock(event_mutex_);
+      event_cv_.wait_for(lock, std::chrono::milliseconds(250), [this, &stop] {
+        return !running_.load(std::memory_order_acquire) || stop.stop_requested()
+               || !event_queue_.empty();
+      });
+      // 2. 如果监控已停止或 Host 请求停止，退出循环
+      if (!running_.load(std::memory_order_acquire) || stop.stop_requested()) break;
+      // 3. 如果队列仍然为空，继续等待
+      if (event_queue_.empty()) continue;
+      // 4. 从队列中取出事件并移除
+      event = std::move(event_queue_.front());
+      // 5. 移除事件后再解锁，避免在处理事件时阻塞其他线程投递新事件
+      event_queue_.pop_front();
+    }
+    // 6. 处理事件。此处不加锁状态缓存，避免阻塞行为树 tick 线程。
+    process_event(std::move(event));
+    processed_events_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  running_.store(false, std::memory_order_release);
+  LOG_INFO("[{}] Managed event worker stopped", TAG);
 }
 
 /**
- * @brief 停止轮询线程
+ * @brief 更新监控快照并将变化推送给 WebSocket 客户端。
  */
-void BehaviorTreeMonitor::stop_poll_thread() noexcept {
-  running_.store(false);
-  if (poll_thread_.joinable()) poll_thread_.join();
-  backend_connected_.store(false);
-}
-
-/**
- * @brief 轮询循环
- */
-void BehaviorTreeMonitor::poll_loop() noexcept {
-  while (running_.load()) {
-    try {
-      LOG_INFO("[{}] Connecting Groot2 publisher: {}:{}", TAG, bt_host_, bt_port_);
-      // 1. 创建 Groot2Client，建立 ZeroMQ 连接
-      Groot2Client client(bt_host_, bt_port_, zmq_recv_timeout_ms_, zmq_send_timeout_ms_);
-      backend_connected_.store(true);
-      {
-        std::lock_guard<std::mutex> lock(health_mutex_);
-        last_error_.clear();
-      }
-      // 2. 获取完整的行为树 XML
-      const std::string xml_text = client.get_full_tree_xml();
-      // 3. 将 XML 转换为 JSON 树结构
-      nlohmann::json tree_message = convert_xml_to_tree(xml_text);
-
+void BehaviorTreeMonitor::process_event(BehaviorTreeMonitorEvent event) noexcept {
+  try {
+    // 1. 根据事件类型更新快照并广播给 WebSocket 客户端
+    if (event.type == BehaviorTreeMonitorEvent::Type::TreeReset) {
+      nlohmann::json tree_message = convert_xml_to_tree(event.tree_xml);
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
         latest_tree_message_ = tree_message;
         latest_status_.clear();
       }
-      // 4. 广播行为树 JSON 树结构给所有 WebSocket 连接的客户端
-      last_success_ms_.store(current_time_ms());
+      // 广播给所有 WebSocket 客户端。此处不加锁 viewers_，避免阻塞行为树 tick 线程。
       broadcast_tree(tree_message);
-      // 5. 进入状态轮询循环
-      while (running_.load()) {
-        const auto begin = std::chrono::steady_clock::now();
-        // 获取状态字节流并解析为节点状态更新列表
-        const auto buffer = client.get_status_buffer();
-        const auto updates = parse_status_buffer(buffer);
-        // 对每个UID的状态更新，检查是否有变化，如果有变化则广播给所有 WebSocket 连接的客户端
-        for (const auto& update : updates) {
-          bool changed = false;
-          {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            const auto it = latest_status_.find(update.uid);
-            if (it == latest_status_.end() || it->second != update.status) {
-              latest_status_[update.uid] = update.status;
-              changed = true;
-            }
-          }
-          if (changed) {
-            LOG_INFO("[{}] Node {} -> {}", TAG, update.uid, update.status);
-            broadcast_status(update);
-          }
+    } else {
+      // 2. 更新节点状态快照并广播给 WebSocket 客户端。此处不加锁 viewers_，避免阻塞行为树 tick 线程。
+      bool changed = false;
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        // 3. 如果状态变化与快照中已有状态相同，则不广播，避免前端重复渲染。
+        const auto it = latest_status_.find(event.status.uid);
+        if (it == latest_status_.end() || it->second != event.status.status) {
+          latest_status_[event.status.uid] = event.status.status;
+          changed = true;
         }
-        // 更新最后成功时间戳，并根据轮询间隔计算睡眠时间
-        last_success_ms_.store(current_time_ms());
-        const auto elapsed = std::chrono::steady_clock::now() - begin;
-        const auto period = std::chrono::milliseconds(status_poll_interval_ms_);
-        // 如果轮询耗时小于轮询间隔，则睡眠剩余时间（默认一次轮询50ms）
-        if (elapsed < period) std::this_thread::sleep_for(period - elapsed);
       }
-    } catch (const std::exception& e) {
-      // 如果轮询线程抛出异常，记录错误日志，更新状态，并在运行标志为 true 时等待一段时间后重试
-      backend_connected_.store(false);
-      {
-        std::lock_guard<std::mutex> lock(health_mutex_);
-        last_error_ = e.what();
-      }
-      LOG_ERROR("[{}] Groot2 polling failed: {}", TAG, e.what());
-      broadcast_bridge_status("error", e.what());
-      // 如果轮询线程仍然运行，等待一段时间后重试连接
-      if (running_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(reconnect_delay_ms_));
-      }
-    } catch (...) {
-      backend_connected_.store(false);
-      {
-        std::lock_guard<std::mutex> lock(health_mutex_);
-        last_error_ = "unknown polling error";
-      }
-      LOG_ERROR("[{}] Groot2 polling failed with unknown error", TAG);
-      broadcast_bridge_status("error", "unknown polling error");
-      if (running_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(reconnect_delay_ms_));
-      }
+      // 4. 如果状态发生变化，则广播给所有 WebSocket 客户端。
+      if (changed) broadcast_status(event.status);
     }
+    // 5. 更新健康检查的最后成功时间戳和清空错误信息。
+    last_success_ms_.store(current_time_ms(), std::memory_order_release);
+    std::lock_guard<std::mutex> lock(health_mutex_);
+    last_error_.clear();
+  } catch (const std::exception& e) {
+    {
+      std::lock_guard<std::mutex> lock(health_mutex_);
+      last_error_ = e.what();
+    }
+    LOG_ERROR("[{}] Event processing failed: {}", TAG, e.what());
+    broadcast_bridge_status("error", e.what());
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(health_mutex_);
+      last_error_ = "unknown event processing error";
+    }
+    LOG_ERROR("[{}] Event processing failed with unknown error", TAG);
+    broadcast_bridge_status("error", "unknown event processing error");
   }
 }
 
@@ -739,32 +674,6 @@ nlohmann::json BehaviorTreeMonitor::convert_xml_to_tree(const std::string& xml_t
       {"root", std::move(tree_root)},
       {"raw_xml", xml_text},
   };
-}
-
-/**
- * @brief 解析状态字节流为节点状态更新列表
- * @param buffer 状态字节流
- * @return 节点状态更新列表
- */
-std::vector<BehaviorTreeNodeStatusUpdate> BehaviorTreeMonitor::parse_status_buffer(
-    const std::vector<std::uint8_t>& buffer) const {
-  // 1. 检查状态字节流的大小是否为3的倍数，如果不是则记录警告日志
-  if (buffer.size() % 3 != 0) {
-    LOG_WARN("[{}] Status buffer size is not a multiple of 3: {}", TAG, buffer.size());
-  }
-  // 2. 预分配节点状态更新列表的大小，避免频繁的内存分配
-  std::vector<BehaviorTreeNodeStatusUpdate> updates;
-  updates.reserve(buffer.size() / 3);
-  const std::int64_t timestamp = current_time_ms();
-  // 4. 遍历状态字节流，每3个字节表示一个节点的状态更新，解析出
-  // UID、状态码和状态名称，并添加到节点状态更新列表中
-  for (std::size_t offset = 0; offset + 3 <= buffer.size(); offset += 3) {
-    const std::uint16_t uid = static_cast<std::uint16_t>(buffer[offset])
-                              | (static_cast<std::uint16_t>(buffer[offset + 1]) << 8U);
-    const std::uint8_t code = buffer[offset + 2];
-    updates.push_back({uid, code, status_name(code), timestamp});
-  }
-  return updates;
 }
 
 /**
@@ -910,15 +819,19 @@ void BehaviorTreeMonitor::remove_dead_session(const char* session_id,
   viewers_.erase(session_id);
 }
 
-PluginHttpResponse BehaviorTreeMonitor::json_response(int status_code, int code,
-                                                      std::string message, nlohmann::json data) {
+PluginHttpResponse BehaviorTreeMonitor::json_response(int status_code, int request_code,
+                                                      std::string request_message,
+                                                      nlohmann::json data) {
   PluginHttpResponse response;
   response.status_code = status_code;
   response.content_type = "application/json; charset=utf-8";
 
+  // 使用与主行为树 HTTP 接口相同的统一响应包装。所有成功和失败响应
+  // 都带有 request_source，便于前端用同一套解析逻辑处理主插件和监控接口。
   nlohmann::json body = {
-      {"code", code},
-      {"message", std::move(message)},
+      {"request_code", request_code},
+      {"request_message", std::move(request_message)},
+      {"request_source", "plugin"},
   };
   if (!data.is_null()) body["data"] = std::move(data);
 

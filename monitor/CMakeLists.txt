@@ -12,18 +12,9 @@ if(NOT TARGET BehaviorTreePlugin)
     "Configure from the bt_plugin root directory: cmake -S . -B build")
 endif()
 
-# BehaviorTree.CPP 在启用 Groot2 支持时创建 cppzmq 接口目标。监控组件通过它
-# 获取 zmq.h、libzmq 以及平台所需的链接信息，用于访问主插件运行时创建的
-# Groot2Publisher。
-if(NOT TARGET cppzmq)
-  message(FATAL_ERROR
-    "The monitor requires cppzmq. "
-    "Keep BTCPP_GROOT_INTERFACE and USE_VENDORED_CPPZMQ enabled.")
-endif()
-
-# 监控后台轮询使用 std::thread。Threads::Threads 会为不同平台提供正确的线程
-# 编译和链接参数，避免在 CMake 中写死 -pthread。
-find_package(Threads REQUIRED)
+# 监控事件消费循环由 BehaviorTreePlug 通过 start_managed_worker()
+# 交给 xplugin Host 托管。monitor 不创建 std::thread，因此本子目录
+# 不再单独 find_package(Threads) 或链接 Threads::Threads。
 
 # 把监控源码直接加入已存在的 BehaviorTreePlugin 目标。
 target_sources(BehaviorTreePlugin PRIVATE
@@ -34,11 +25,6 @@ target_sources(BehaviorTreePlugin PRIVATE
 
 target_include_directories(BehaviorTreePlugin PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
-)
-
-target_link_libraries(BehaviorTreePlugin PRIVATE
-  cppzmq
-  Threads::Threads
 )
 
 # 允许部署环境单独指定网页输出目录；默认复制到主插件输出目录下的

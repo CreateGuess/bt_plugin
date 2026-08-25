@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "behavior_tree_plug.hpp"
+#include "bt_manager.hpp"
 #include "bt_monitor_plugin.hpp"
 
 /*
@@ -18,9 +19,7 @@
  *       |
  *       +-- BehaviorTreePlug                  唯一 PLUGIN_DECLARE
  *       |
- *       +-- libBehaviorTreeMonitor.a / .lib   构建期静态链接，不单独部署
- *               +-- BehaviorTreeMonitor
- *               +-- Groot2Client
+ *       +-- BehaviorTreeMonitor              监控缓存与 WebSocket 分发
  *
  * BehaviorTreeMonitor 是普通 C++ 类，不能直接调用 PluginBase 的 protected Host
  * API。因此端点注册留在 BehaviorTreePlug 成员函数中；WebSocket 发送能力通过
@@ -36,12 +35,36 @@ BehaviorTreePlug::~BehaviorTreePlug() = default;
 /**
  * @brief 监控功能的总入口
  */
-void BehaviorTreePlug::startMonitor() noexcept {
+bool BehaviorTreePlug::startMonitor() noexcept {
   try {
-    // 1. 判断监控对象是否已经存在。若存在则直接启动，避免重复注册 HTTP/WS 端点。
+    // 1. 判断监控对象是否已经存在。插件 stop -> start 时 Host 端点
+    //    和 monitor_ 对象都会复用，但 BTManager 是新建的，因此必须
+    //    重新注册事件回调。
     if (monitor_) {
       monitor_->start();
-      return;
+      BehaviorTreeMonitor* const monitor_ptr = monitor_.get();
+
+      if (!start_managed_worker(
+              "behavior-tree-monitor-events",
+              [monitor_ptr](PluginStopToken stop) {
+                monitor_ptr->run_event_loop(stop);
+              })) {
+        LOG_ERROR("[{}] Failed to start managed behavior tree monitor worker", TAG);
+        monitor_->stop();
+        return false;
+      }
+
+      if (auto* manager = G_BT_MANAGER()) {
+        manager->setMonitorCallbacks(
+            [monitor_ptr](std::string tree_xml) {
+              monitor_ptr->enqueue_tree_reset(std::move(tree_xml));
+            },
+            [monitor_ptr](std::uint16_t uid, std::uint8_t status_code, std::int64_t timestamp_ms) {
+              monitor_ptr->enqueue_node_status(uid, status_code, timestamp_ms);
+            });
+      }
+      LOG_INFO("[{}] Monitor restarted in event-driven mode", TAG);
+      return true;
     }
     // 2. 创建监控对象，传入 WebSocket 发送回调。回调由主插件提供，确保 Host
     //    持有的 WebSocket 发送函数始终指向有效实例。
@@ -56,12 +79,12 @@ void BehaviorTreePlug::startMonitor() noexcept {
 
     // 3. 注册behavior-tree HTTP端点：三个监控查询路由，以及读取
     //    bt_trees/bt_nodes.xml 的 load.node 路由。
-    //   curl -X POST http://192.168.2.36:80/backend/plugin-http/behavior_tree_monitor/tree.snapshot -H
+    //   curl -X POST http://192.168.2.36:80/backend/plugin-http/behavior_tree_monitor/tree.snapshot
+    //   -H "Content-Type: application/json" -d '{}' curl -X POST
+    //   http://192.168.2.36:80/backend/plugin-http/behavior_tree_monitor/status.snapshot -H
     //   "Content-Type: application/json" -d '{}' curl -X POST
-    //   http://192.168.2.36:80/backend/plugin-http/behavior_tree_monitor/status.snapshot -H "Content-Type:
-    //   application/json" -d '{}' curl -X POST
-    //   http://192.168.2.36:80/backend/plugin-http/behavior_tree_monitor/bridge.health -H "Content-Type:
-    //   application/json" -d '{}'
+    //   http://192.168.2.36:80/backend/plugin-http/behavior_tree_monitor/bridge.health -H
+    //   "Content-Type: application/json" -d '{}'
 
     PluginHttpEndpointOptions http_options;
     http_options.methods = {"POST"};
@@ -83,7 +106,7 @@ void BehaviorTreePlug::startMonitor() noexcept {
             },
             std::move(http_options))) {
       LOG_ERROR("[{}] Failed to register behavior tree monitor HTTP endpoint", TAG);
-      return;
+      return false;
     }
 
     // HTTP 注册成功后立即保存对象，确保 Host 持有的回调始终指向有效实例。
@@ -115,21 +138,60 @@ void BehaviorTreePlug::startMonitor() noexcept {
     }
 
     monitor_->start();
+
+    // 6. 使用 xplugin Host 托管的 worker 消费事件队列。监控类
+    //    不再自行创建 std::thread，Host 会通过 PluginStopToken 请求
+    //    worker 停止并负责最终回收。
+    if (!start_managed_worker(
+            "behavior-tree-monitor-events",
+            [monitor_ptr](PluginStopToken stop) {
+              monitor_ptr->run_event_loop(stop);
+            })) {
+      LOG_ERROR("[{}] Failed to start managed behavior tree monitor worker", TAG);
+      monitor_->stop();
+      return false;
+    }
+
+    // 7. 将 BTManager 已有的 StatusObserver 回调接到监控事件队列。
+    //    这两个 lambda 只负责入队，不在行为树 tick 线程中解析
+    //    XML 或发送 WebSocket。clearMonitorCallbacks() 会在 stopMonitor()
+    //    中先于 monitor_->stop() 执行，防止对象销毁后回调仍被调用。
+    if (auto* manager = G_BT_MANAGER()) {
+      manager->setMonitorCallbacks(
+          [monitor_ptr](std::string tree_xml) {
+            monitor_ptr->enqueue_tree_reset(std::move(tree_xml));
+          },
+          [monitor_ptr](std::uint16_t uid, std::uint8_t status_code, std::int64_t timestamp_ms) {
+            monitor_ptr->enqueue_node_status(uid, status_code, timestamp_ms);
+          });
+    }
+
     LOG_INFO(
         "[{}] Monitor: HTTP /backend/plugin-http/behavior_tree_monitor/* | WS "
-        "/backend/plugin-ws/behavior_tree_monitor ({})",
+        "/backend/plugin-ws/behavior_tree_monitor ({}, event-driven)",
         TAG, ws_registered ? "enabled" : "unavailable");
+    return true;
   } catch (const std::exception& e) {
     LOG_ERROR("[{}] Behavior tree monitor start failed: {}", TAG, e.what());
   } catch (...) {
     LOG_ERROR("[{}] Behavior tree monitor start failed with unknown error", TAG);
   }
+  // 如果异常发生在 managed worker 已启动之后，必须唤醒它并
+  // 让它返回，不能把半启动的监控任务留给 Host。
+  if (monitor_) monitor_->stop();
+  return false;
 }
 
 /**
  * @brief 停止监控功能
  */
 void BehaviorTreePlug::stopMonitor() noexcept {
+  // 先断开 BTManager -> monitor_ 的回调，再唤醒并停止托管 worker。
+  // clearMonitorCallbacks() 内部的互斥锁会等待已经进入的一次投递结束。
+  if (monitor_ && started_.load(std::memory_order_acquire)) {
+    if (auto* manager = G_BT_MANAGER()) manager->clearMonitorCallbacks();
+  }
+
   // stop() 是幂等的；on_stop 与 on_unload 都可以调用。保留对象到插件析构，避免
   // Host 中尚在收尾的回调观察到悬空 monitor_ 指针。
   if (monitor_) monitor_->stop();

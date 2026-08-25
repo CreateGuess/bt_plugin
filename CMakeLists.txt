@@ -49,7 +49,8 @@ endif()
 #   - 不构建命令行工具、示例、测试和 SQLite 日志；
 #   - 构建静态库并最终嵌入插件；
 #   - 使用随源码提供的 cppzmq 和 tinyxml2；
-#   - 保留默认开启的 Groot2 接口，通过 1667 端口发布行为树状态。
+#   - 保留默认开启的 Groot2 接口，供 Groot2 调试工具使用。
+# 网页监控不再轮询 1667，而是直接消费 StatusObserver 的状态事件。
 set(BT_OPTIONS
     "BTCPP_BUILD_TOOLS OFF"
     "BTCPP_SHARED_LIBS OFF"
@@ -154,7 +155,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 #
 # monitor/CMakeLists.txt 使用 target_sources 将监控实现加入 BehaviorTreePlugin，
 # 最终只有一个插件动态库和一个 PLUGIN_DECLARE 入口。监控只在主插件生命周期
-# 中附加启停，不改变 BTManager 的树加载、节点注册和 tick 执行逻辑。
+# 中附加启停；BTManager 只向监控队列投递树重置和节点状态事件，
+# 不改变树加载、节点注册和 tick 执行逻辑。
 add_subdirectory(monitor)
 
 # cmake .. -DCMAKE_DISABLE_FIND_PACKAGE_ament_cmake=ON

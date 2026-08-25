@@ -7,9 +7,11 @@
 #include <behaviortree_cpp/tree_node.h>
 
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "overall_system_nrtstate.pb.h"
 #include "overall_system_rtstate.pb.h"
@@ -328,14 +330,41 @@ class BTManager final : public SingletonDclp<BTManager> {
   enum class State { IDLE, RUNNING, PAUSED, SWITCHING };
 
 public:
+  // 监控回调只是 BTManager 与内部监控组件之间的事件出口，
+  // 不参与行为树的加载、tick 或状态判定。
+  using MonitorTreeResetCallback = std::function<void(std::string)>;
+  using MonitorNodeStatusCallback =
+      std::function<void(std::uint16_t, std::uint8_t, std::int64_t)>;
+
+  /**
+   * @brief BTManager 同步操作的执行结果。
+   *
+   * start() 不再只表示“已提交启动请求”，而是在 XML 解析、
+   * 行为树创建和 Groot2Publisher 创建全部成功后才返回 success=true。
+   */
+  struct OperationResult {
+    bool success{false};
+    std::string error;
+  };
+
   explicit BTManager(IPubSub* pubsub, IReqRep* reqrep) : pubsub_(pubsub), reqrep_(reqrep) {};
   ~BTManager() = default;
 
   bool init();
 
+  /**
+   * @brief 注册监控事件接收器。
+   *
+   * 函数可在插件启动后、行为树加载前调用。clearMonitorCallbacks()
+   * 会等待正在执行的投递结束，保证监控对象销毁后不再被访问。
+   */
+  void setMonitorCallbacks(MonitorTreeResetCallback tree_reset,
+                           MonitorNodeStatusCallback node_status);
+  void clearMonitorCallbacks() noexcept;
+
   bool loadTree(const std::string& xml);
 
-  void start(int = 50);
+  OperationResult start(int period = 50);
   void pause();
   void resume();
   BT::NodeStatus step();
@@ -375,7 +404,7 @@ public:
 private:
   void loop();
 
-  void switchTree();
+  OperationResult switchTree();
 
   void onNodeStatusChanged(const BT::TreeNode& node, BT::NodeStatus prev, BT::NodeStatus curr);
 
@@ -411,6 +440,12 @@ private:
   std::atomic_bool running_{false};
   std::atomic_bool paused_{true};
   std::atomic_bool stopping_{false};
+
+  // 调用回调时保持该锁，使 clearMonitorCallbacks() 成为明确的
+  // 生命周期屏障。回调本身只向监控队列入队，不做网络 I/O。
+  mutable std::mutex monitor_callbacks_mtx_;
+  MonitorTreeResetCallback monitor_tree_reset_callback_;
+  MonitorNodeStatusCallback monitor_node_status_callback_;
 
   mutable std::mutex lifecycle_mtx_;
   mutable std::mutex tree_mtx_;

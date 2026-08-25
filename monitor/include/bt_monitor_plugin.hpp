@@ -3,12 +3,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -22,7 +23,7 @@
 
 
 /**
- * @brief 一条从 Groot2 紧凑状态缓冲区解码出的节点状态
+ * @brief 一条由 BTManager 状态回调产生的节点状态
  */
 struct BehaviorTreeNodeStatusUpdate {
   std::uint16_t uid{0};
@@ -32,52 +33,24 @@ struct BehaviorTreeNodeStatusUpdate {
 };
 
 /**
- * @brief Groot2 监控协议的同步请求客户端。
+ * @brief Host 托管 worker 内部使用的监控事件。
  *
- * 该类只负责“监控桥 -> Groot2Publisher”这一段通信：
- *
- *   BehaviorTree.CPP / Groot2Publisher
- *                 ^
- *                 | ZeroMQ REQ/REP
- *                 |
- *             Groot2Client
- *
- * 它不创建行为树、不执行 tick，也不注册 xplugin 的 HTTP/WebSocket 接口。
- * xplugin 生命周期仍由 BehaviorTreePlug 管理。这样可以把底层二进制协议与
- * 上层缓存、JSON 转换、WebSocket 推送分开，避免监控代码影响行为树业务逻辑。
- *
- * 线程约束：一个 Groot2Client 实例只在监控轮询线程中使用，不支持多个线程
- * 同时调用。ZeroMQ 的 socket 也不会跨线程移动。
- *
- * 异常策略：构造、发送、接收或协议校验失败时抛出异常，由外层 poll_loop()
- * 统一记录健康状态、通知 WebSocket 客户端，并在延迟后重建整个连接。
+ * BTManager 的状态回调只负责把轻量数据放入队列；XML 解析、
+ * 缓存更新和 WebSocket 发送由 xplugin Host 托管的 worker 执行。
+ * 这样即使某个前端发送较慢，也不会阻塞行为树 tick 线程。
  */
-class Groot2Client {
-public:
-  Groot2Client(std::string host, int port, int recv_timeout_ms, int send_timeout_ms);
-  ~Groot2Client();  
+struct BehaviorTreeMonitorEvent {
+  enum class Type { TreeReset, NodeStatus };
 
-  Groot2Client(const Groot2Client&) = delete;
-  Groot2Client& operator=(const Groot2Client&) = delete;
-
-  std::string get_full_tree_xml();
-  std::vector<std::uint8_t> get_status_buffer();
-
-private:
-  std::vector<std::vector<std::uint8_t>> request(std::uint8_t request_type);
-  static std::vector<std::uint8_t> make_header(std::uint8_t request_type);
-  void close() noexcept;
-
-private:
-  std::string address_;
-  void* context_{nullptr};
-  void* socket_{nullptr};
+  Type type{Type::NodeStatus};
+  std::string tree_xml;
+  BehaviorTreeNodeStatusUpdate status;
 };
 
 /**
  * @brief 负责行为树监控功能的实现
  * - 管理后台线程。
- * - 调用 Groot2Client。
+ * - 接收 BTManager 投递的行为树事件。
  * - 解析 XML 和状态。
  * - 缓存树和节点状态。
  * - 处理 HTTP 请求。
@@ -92,10 +65,6 @@ public:
   using WsSendLatestText = std::function<PluginWsSendResult(
       const char* session_id, const char* topic, std::string_view text)>;
 
-  static constexpr std::uint8_t PROTOCOL_ID = 2;
-  static constexpr std::uint8_t REQ_FULLTREE = static_cast<std::uint8_t>('T');
-  static constexpr std::uint8_t REQ_STATUS = static_cast<std::uint8_t>('S');
-
   BehaviorTreeMonitor(WsSendText ws_send_text, WsSendLatestText ws_send_latest_text);
   ~BehaviorTreeMonitor();
 
@@ -104,6 +73,20 @@ public:
 
   void start();
   void stop() noexcept;
+
+  /**
+   * @brief 由 PluginBase::start_managed_worker() 调用的事件消费入口。
+   *
+   * BehaviorTreeMonitor 不创建、不 join 任何 std::thread。工作线程的
+   * 创建、停止请求和回收全部交给 xplugin Host 管理。
+   */
+  void run_event_loop(PluginStopToken stop) noexcept;
+
+  // 下面两个函数可从行为树 tick 线程调用。它们只入队，
+  // 不解析 XML、不加锁监控状态缓存、不执行任何网络发送。
+  void enqueue_tree_reset(std::string tree_xml) noexcept;
+  void enqueue_node_status(std::uint16_t uid, std::uint8_t status_code,
+                           std::int64_t timestamp_ms) noexcept;
 
   PluginHttpResponse handle_http_request(const PluginHttpRequest& req);
   void handle_ws_open(const char* session_id);
@@ -117,14 +100,9 @@ private:
   PluginHttpResponse handle_bridge_health();
   PluginHttpResponse handle_load_node();
 
-  void start_poll_thread();
-  void stop_poll_thread() noexcept;
-  void poll_loop() noexcept;
+  void process_event(BehaviorTreeMonitorEvent event) noexcept;
 
   nlohmann::json convert_xml_to_tree(const std::string& xml_text) const;
-  std::vector<BehaviorTreeNodeStatusUpdate> parse_status_buffer(
-      const std::vector<std::uint8_t>& buffer) const;
-
   void broadcast_tree(const nlohmann::json& tree_message) noexcept;
   void broadcast_status(const BehaviorTreeNodeStatusUpdate& update) noexcept;
   void broadcast_bridge_status(std::string status, std::string message) noexcept;
@@ -135,7 +113,16 @@ private:
                                    std::string_view text) noexcept;
   void remove_dead_session(const char* session_id, PluginWsSendResult result) noexcept;
 
-  static PluginHttpResponse json_response(int status_code, int code, std::string message,
+  /**
+   * @brief 生成与主行为树插件格式一致的 HTTP JSON 响应。
+   *
+   * @param status_code HTTP 状态码，例如 200、404、500。
+   * @param request_code 业务结果码：0 表示成功，-1 表示失败。
+   * @param request_message 成功时为 "ok"，失败时为具体错误信息。
+   * @param data 可选的业务数据；为 null 时不输出 data 字段。
+   */
+  static PluginHttpResponse json_response(int status_code, int request_code,
+                                          std::string request_message,
                                           nlohmann::json data = nullptr);
   static std::int64_t current_time_ms() noexcept;
 
@@ -143,15 +130,17 @@ private:
   WsSendText ws_send_text_;
   WsSendLatestText ws_send_latest_text_;
 
-  std::string bt_host_{"192.168.2.36"};
-  int bt_port_{1667};
-  int zmq_recv_timeout_ms_{5000};
-  int zmq_send_timeout_ms_{5000};
-  int status_poll_interval_ms_{50};
-  int reconnect_delay_ms_{2000};
-
   std::atomic<bool> running_{false};
-  std::thread poll_thread_;
+
+  // 事件队列是 BTManager 回调线程和 Host 托管 worker 之间的边界。
+  // 树切换事件必须保留；同一节点的状态更新会由 Host 的
+  // ws_send_latest_text 再做一次主题级合并，防止慢客户端无限堆积。
+  std::mutex event_mutex_;
+  std::condition_variable event_cv_;
+  std::deque<BehaviorTreeMonitorEvent> event_queue_;
+  std::atomic<std::uint64_t> received_events_{0};
+  std::atomic<std::uint64_t> coalesced_events_{0};
+  std::atomic<std::uint64_t> processed_events_{0};
 
   std::mutex viewers_mutex_;
   std::unordered_set<std::string> viewers_;
@@ -162,7 +151,6 @@ private:
 
   mutable std::mutex health_mutex_;
   std::string last_error_;
-  std::atomic<bool> backend_connected_{false};
   std::atomic<std::int64_t> last_success_ms_{0};
 
   std::atomic<std::uint64_t> ws_send_failures_{0};

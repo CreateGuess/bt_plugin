@@ -43,14 +43,15 @@ namespace {
 
 namespace {
   PluginHttpResponse toHttpResponse(const JsonRpcResult& result) {
-    PluginHttpResponse res;
-    res.status_code = result.http_status;
-    res.content_type = "application/json; charset=utf-8";
-    nlohmann::json out{{"code", result.code}, {"message", result.message}};
-    if (!result.data.is_null()) out["data"] = result.data;
-    const auto text = out.dump();
-    res.body.assign(text.begin(), text.end());
-    return res;
+    // PluginHttpResponse res;
+    // res.status_code = result.http_status;
+    // res.content_type = "application/json; charset=utf-8";
+    // nlohmann::json out{{"code", result.code}, {"message", result.message}};
+    // if (!result.data.is_null()) out["data"] = result.data;
+    // const auto text = out.dump();
+    // res.body.assign(text.begin(), text.end());
+    // return res;
+    return ::to_http_response(result);
   }
 }  // namespace
 
@@ -119,16 +120,25 @@ bool BehaviorTreePlug::on_start() noexcept {
   LOG_INFO("[{}] http: POST /backend/plugin-http/behavior_tree/<module> ({} routes)", TAG,
            routes_->size());
 
-  // 监控作为当前插件库内的附加组件启动。内部会自行处理异常，不改变主插件
-  // 原有的启动返回值和行为树执行流程。
-  startMonitor();
+  // 监控作为当前插件库内的组件启动。托管 worker 或端点启动失败时
+  // 回滚 BTManager，避免插件处于“行为树可用但监控未启动”的部分启动状态。
+  if (!startMonitor()) {
+    LOG_ERROR("[{}] Failed to start behavior tree monitor", TAG);
+    if (auto* manager = G_BT_MANAGER()) {
+      manager->beginShutdown();
+      manager->stop();
+    }
+    BTManager::Destruct();
+    started_.store(false, std::memory_order_release);
+    return false;
+  }
 
   LOG_INFO("[{}] Started!", TAG);
   return true;
 }
 
 void BehaviorTreePlug::on_stop() noexcept {
-  // 先停止监控轮询，避免行为树管理器销毁后仍继续请求 Groot2 数据。
+  // 先断开监控事件回调并停止分发线程，再销毁行为树管理器。
   stopMonitor();
 
   bool expected = true;
@@ -420,13 +430,22 @@ JsonRpcResult BehaviorTreePlug::handleRead(const nlohmann::json& data) {
 
 JsonRpcResult BehaviorTreePlug::handleStart(const nlohmann::json& data) {
   try {
-    int period = data.value("period", 1000);
-    G_BT_MANAGER()->start(period);
-    return JsonRpcResult::ok();
+    const int period = data.value("period", 1000);
+    const auto result = G_BT_MANAGER()->start(period);
+
+    // start() 只有在 XML 解析、行为树创建、Groot2Publisher 创建以及 tick 线程
+    // 启动全部成功后才返回 success=true。将 BehaviorTree.CPP 的具体解析错误
+    // 原样返回前端，避免日志中已失败但 HTTP 仍显示 start 成功。
+    if (!result.success) {
+      return JsonRpcResult::error("Failed to start behavior tree: " + result.error, -1, 422);
+    }
+
+    return JsonRpcResult::ok("ok");
   } catch (const std::exception& e) {
-    return JsonRpcResult::error("Handler exception: " + std::string(e.what()));
+    return JsonRpcResult::error("Start behavior tree exception: " + std::string(e.what()), -1,
+                                500);
   } catch (...) {
-    return JsonRpcResult::error("Handler unknown exception");
+    return JsonRpcResult::error("Start behavior tree unknown exception", -1, 500);
   }
 }
 

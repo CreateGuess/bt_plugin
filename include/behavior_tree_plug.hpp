@@ -36,9 +36,9 @@ private:
   JsonRpcResult handleStop(const nlohmann::json& data);
   JsonRpcResult handleSaveNode(const nlohmann::json& data);
 
-  // 监控是主插件内部的附加组件。启动失败只记录日志，不改变原行为树插件的
-  // 启停结果；这样监控异常不会影响行为树执行逻辑。
-  void startMonitor() noexcept;
+  // 监控是主插件内部的组件。返回 false 表示 HTTP/WS 端点或
+  // Host 托管 worker 启动失败，on_start() 将回滚已创建的 BTManager。
+  bool startMonitor() noexcept;
   void stopMonitor() noexcept;
 
 private:
