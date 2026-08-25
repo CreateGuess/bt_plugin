@@ -143,6 +143,45 @@ current_version/
 当前行为树主插件及 monitor 均使用 `../bt_trees` 相对路径。因此
 rpc_gateway 应当从 `current_version/bin` 作为工作目录启动。
 
+## 行为树 XML 读取接口
+
+`read` 保持原有的文件列表功能：
+
+```text
+POST /backend/plugin-http/behavior_tree/read
+```
+
+读取指定行为树 XML 使用独立的 `read.xml` 接口：
+
+```text
+POST /backend/plugin-http/behavior_tree/read.xml
+```
+
+请求：
+
+```json
+{
+  "file": "move_test.xml"
+}
+```
+
+成功响应：
+
+```json
+{
+  "data": {
+    "file": "move_test.xml",
+    "content": "<root BTCPP_format=\"4\">...</root>"
+  },
+  "request_code": 0,
+  "request_message": "ok",
+  "request_source": "plugin"
+}
+```
+
+该接口只允许读取 `bt_trees` 目录内的 `.xml` 普通文件，绝对路径和
+`../` 越界路径会被拒绝。
+
 ## 监控功能
 
 监控功能作为 `BehaviorTreePlugin` 的内部组件启动，它不使用第二个

@@ -207,6 +207,7 @@ JsonRpcRouter::RouteMap BehaviorTreePlug::buildRoutes() {
   return {
       {"load", [this](const nlohmann::json& data) { return handleLoad(data); }},
       {"read", [this](const nlohmann::json& data) { return handleRead(data); }},
+      {"read.xml", [this](const nlohmann::json& data) { return handleReadXml(data); }},
       {"start", [this](const nlohmann::json& data) { return handleStart(data); }},
       {"stop", [this](const nlohmann::json& data) { return handleStop(data); }},
       {"save", [this](const nlohmann::json& data) { return handleSaveNode(data); }},
@@ -425,6 +426,72 @@ JsonRpcResult BehaviorTreePlug::handleRead(const nlohmann::json& data) {
     return JsonRpcResult::error("Handler exception: " + std::string(e.what()));
   } catch (...) {
     return JsonRpcResult::error("Handler unknown exception");
+  }
+}
+
+/**
+ * @brief 读取 bt_trees 目录下指定的行为树 XML 文件。
+ *
+ * HTTP 路由：
+ *   POST /backend/plugin-http/behavior_tree/read.xml
+ *
+ * 请求示例：
+ *   {"file":"move_test.xml"}
+ *
+ * 该接口与 /read 的文件列表功能分开，避免前端根据
+ * 参数是否存在来猜测响应中是 files 还是 content。
+ */
+JsonRpcResult BehaviorTreePlug::handleReadXml(const nlohmann::json& data) {
+  try {
+    // file 是必填字符串。单独检查类型，避免 data.value()
+    // 因前端传入 null、数字或数组而抛出类型异常并返回 500。
+    if (!data.contains("file") || !data["file"].is_string()) {
+      return JsonRpcResult::error("Missing or invalid string field: file", -1, 400);
+    }
+
+    const std::string file = data["file"].get<std::string>();
+    if (file.empty()) {
+      return JsonRpcResult::error("File name cannot be empty", -1, 400);
+    }
+
+    // 该接口只用于行为树 XML。先检查扩展名，再使用
+    // resolveTreePath() 做目录边界校验，防止 ../ 或绝对路径读取
+    // bt_trees 之外的文件。
+    const fs::path requested_path(file);
+    if (requested_path.extension() != ".xml") {
+      return JsonRpcResult::error("Only .xml behavior tree files can be read", -1, 400);
+    }
+
+    const auto resolved = resolveTreePath(file);
+    if (!resolved) {
+      return JsonRpcResult::error("Invalid behavior tree file path", -1, 400);
+    }
+
+    std::error_code ec;
+    if (!fs::is_regular_file(*resolved, ec) || ec) {
+      return JsonRpcResult::error("Behavior tree XML file not found: " + file, -1, 404);
+    }
+
+    std::ifstream input(*resolved, std::ios::in | std::ios::binary);
+    if (!input) {
+      return JsonRpcResult::error("Failed to open behavior tree XML: " + file, -1, 500);
+    }
+
+    std::ostringstream stream;
+    stream << input.rdbuf();
+    if (input.bad()) {
+      return JsonRpcResult::error("Failed to read behavior tree XML: " + file, -1, 500);
+    }
+
+    std::string content = stream.str();
+    return JsonRpcResult::ok(
+        "ok", nlohmann::json{{"file", requested_path.filename().string()},
+                             {"content", std::move(content)}});
+  } catch (const std::exception& e) {
+    return JsonRpcResult::error("Read behavior tree XML exception: " + std::string(e.what()),
+                                -1, 500);
+  } catch (...) {
+    return JsonRpcResult::error("Read behavior tree XML unknown exception", -1, 500);
   }
 }
 

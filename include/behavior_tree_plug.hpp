@@ -32,6 +32,7 @@ private:
   PluginHttpResponse handleHttpRequest(const PluginHttpRequest& req);
   JsonRpcResult handleLoad(const nlohmann::json& data);
   JsonRpcResult handleRead(const nlohmann::json& data);
+  JsonRpcResult handleReadXml(const nlohmann::json& data);
   JsonRpcResult handleStart(const nlohmann::json& data);
   JsonRpcResult handleStop(const nlohmann::json& data);
   JsonRpcResult handleSaveNode(const nlohmann::json& data);
