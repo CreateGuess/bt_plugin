@@ -5,10 +5,13 @@
 #include <fstream>
 
 #include "auto_registration.hpp"
+// 注册所有行为树节点
 #include "bt_action/jog_joint.hpp"
 #include "bt_action/jog_joint_to_angle.hpp"
 #include "bt_action/move_absj.hpp"
 #include "bt_action/move_absj_joint_target.hpp"
+#include "bt_action/mobile_robot_modbus_tcp_jgbot.hpp"
+// 注册所有行为树条件
 #include "bt_condition/is_enable.hpp"
 #include "bt_condition/is_system_running.hpp"
 #include "tinyxml2.h"
@@ -390,6 +393,7 @@ REGISTER_NODE(JogJoint, "JogJoint");
 REGISTER_NODE(JogJointToAngle, "JogJointToAngle");
 REGISTER_NODE(MoveAbsJ, "MoveAbsJ");
 REGISTER_NODE(MoveAbsJJointTarget, "MoveAbsJJointTarget");
+REGISTER_NODE(MobileRobotModbusTCPJGBOT, "MobileRobotModbusTCPJGBOT");
 
 // bt condition
 REGISTER_NODE(IsSystemRunning, "IsSystemRunning");
